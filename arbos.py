@@ -1955,6 +1955,41 @@ def _kill_stale_claude_procs():
         pass
 
 
+def _gsd_feedback_loop():
+    """Push compact Telegram updates when GSD state changes."""
+    poll_s = int(os.environ.get("GSD_FEEDBACK_POLL", "8"))
+    min_send_s = int(os.environ.get("GSD_FEEDBACK_MIN_SEND", "20"))
+    last_sig = ""
+    last_sent = 0.0
+
+    while not _shutdown.is_set():
+        try:
+            if not _engine_manager or _engine_manager.engine_name != "gsd":
+                _shutdown.wait(timeout=poll_s)
+                continue
+
+            st = _engine_manager.status()
+            running = bool(st.get("running"))
+            mode = str(st.get("mode") or "")
+            detail = str(st.get("detail") or "").strip()
+            sig = f"{running}|{mode}|{detail}"
+
+            now = time.time()
+            if detail and sig != last_sig and (now - last_sent) >= min_send_s:
+                _send_telegram_text(
+                    f"GSD update\n"
+                    f"• mode: {mode}\n"
+                    f"• running: {'yes' if running else 'no'}\n"
+                    f"• state: {detail[:320]}"
+                )
+                last_sent = now
+                last_sig = sig
+        except Exception as exc:
+            _log(f"gsd feedback loop error: {str(exc)[:120]}")
+
+        _shutdown.wait(timeout=poll_s)
+
+
 def _send_cli(args: list[str]):
     """CLI entry point: python arbos.py send 'message' [--file path]
 
@@ -2080,6 +2115,7 @@ def main() -> None:
     if _engine_manager.engine_name == "arbos":
         threading.Thread(target=agent_loop, daemon=True).start()
     else:
+        threading.Thread(target=_gsd_feedback_loop, daemon=True).start()
         existing_goal = GOAL_FILE.read_text().strip() if GOAL_FILE.exists() else ""
         if existing_goal:
             _log("existing goal detected on startup; resuming gsd engine")
