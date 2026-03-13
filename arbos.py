@@ -1719,8 +1719,14 @@ def run_bot():
         if not _is_owner(uid):
             _reject(message)
             return
+
+        goal_text = GOAL_FILE.read_text().strip() if GOAL_FILE.exists() else ""
         if _engine_manager:
-            _engine_manager.resume()
+            if goal_text:
+                _engine_manager.start(goal_text)
+            else:
+                _engine_manager.resume()
+
         bot.send_message(message.chat.id, "Resumed current engine loop.")
         _log("resumed via /resume command")
 
@@ -2118,8 +2124,8 @@ def main() -> None:
         threading.Thread(target=_gsd_feedback_loop, daemon=True).start()
         existing_goal = GOAL_FILE.read_text().strip() if GOAL_FILE.exists() else ""
         if existing_goal:
-            _log("existing goal detected on startup; resuming gsd engine")
-            _engine_manager.resume()
+            _log("existing goal detected on startup; starting gsd engine with GOAL.md")
+            _engine_manager.start(existing_goal)
 
     threading.Thread(target=run_bot, daemon=True).start()
 
