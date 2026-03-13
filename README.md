@@ -21,7 +21,29 @@ Arbos just loops a `GOAL.md` through a coding agent.
 ## Requirements
 
 - [Telegram Bot token](https://core.telegram.org/bots#how-do-i-create-a-bot)
-- [Chutes API key](https://chutes.ai)
+- [Chutes API key](https://chutes.ai) (if using Claude/Chutes path)
+- `gsd` CLI installed (if using `ENGINE=gsd`, default)
+
+## Engine selection
+
+Arbos supports two loop engines:
+
+```env
+ENGINE=gsd   # default, recommended
+# ENGINE=arbos  # legacy fallback
+```
+
+- `ENGINE=gsd`: Telegram acts as control plane while GSD runs the build loop.
+- `ENGINE=arbos`: legacy Arbos in-process loop.
+
+## Telegram control commands
+
+- `/goal <text>` — set goal (one goal maps to one milestone intent)
+- `/status` — show engine + loop status
+- `/pause` — pause current engine
+- `/resume` — resume current engine
+- `/discuss <text>` — send an operator note to the engine discuss channel
+- `/stop` — clear goal and pause
 
 ## Getting started
 

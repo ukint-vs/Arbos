@@ -24,6 +24,8 @@ from cryptography.hazmat.primitives import hashes
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from system.engine.manager import EngineManager
+
 WORKING_DIR = Path(__file__).parent
 PROMPT_FILE = WORKING_DIR / "PROMPT.md"
 CONTEXT_DIR = WORKING_DIR / "context"
@@ -219,6 +221,7 @@ def _redact_secrets(text: str) -> str:
     return text
 MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "4"))
 PROVIDER = os.environ.get("PROVIDER", "chutes")
+ENGINE = os.environ.get("ENGINE", "gsd").strip().lower() or "gsd"
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8089"))
 PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "600"))
 CHUTES_API_KEY = os.environ.get("CHUTES_API_KEY", "")
@@ -257,6 +260,7 @@ _claude_semaphore = threading.Semaphore(MAX_CONCURRENT)
 _step_count = 0
 _goal_hash: str = ""
 _goal_step_count = 0
+_engine_manager: EngineManager | None = None
 _token_usage = {"input": 0, "output": 0}
 _token_lock = threading.Lock()
 _child_procs: set[subprocess.Popen] = set()
@@ -289,6 +293,11 @@ def _reset_tokens():
     with _token_lock:
         _token_usage["input"] = 0
         _token_usage["output"] = 0
+
+
+def _arbos_status_provider() -> tuple[int, int, bool]:
+    active = bool(GOAL_FILE.exists() and GOAL_FILE.read_text().strip())
+    return _step_count, _goal_step_count, active
 
 
 def _get_tokens() -> tuple[int, int]:
@@ -1673,13 +1682,63 @@ def run_bot():
             dirs = sorted([d for d in RUNS_DIR.iterdir() if d.is_dir()], key=lambda d: d.name)
             if dirs:
                 last_run = dirs[-1].name
+
+        status = _engine_manager.status() if _engine_manager else {
+            "engine": ENGINE,
+            "running": active,
+            "mode": "unknown",
+            "detail": "engine manager not initialized",
+        }
+
         lines = [
+            f"Engine: {status.get('engine')} ({status.get('mode')})",
+            f"Engine running: {'yes' if status.get('running') else 'no'}",
+            f"PID: {status.get('pid') or '-'}",
+            f"Engine detail: {status.get('detail', '')}",
             f"Steps: {_goal_step_count} on current goal, {_step_count} total",
             f"Loop active: {'yes' if active else 'no (goal empty)'}",
             f"Last run: {last_run or 'none'}",
             f"Goal: {goal[:300]}",
         ]
         bot.send_message(message.chat.id, "\n".join(lines))
+
+    @bot.message_handler(commands=["pause"])
+    def handle_pause(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        if _engine_manager:
+            _engine_manager.stop(graceful=True)
+        bot.send_message(message.chat.id, "Paused current engine loop.")
+        _log("paused via /pause command")
+
+    @bot.message_handler(commands=["resume"])
+    def handle_resume(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        if _engine_manager:
+            _engine_manager.resume()
+        bot.send_message(message.chat.id, "Resumed current engine loop.")
+        _log("resumed via /resume command")
+
+    @bot.message_handler(commands=["discuss"])
+    def handle_discuss(message):
+        uid = message.from_user.id if message.from_user else None
+        if not _is_owner(uid):
+            _reject(message)
+            return
+        text = (message.text or "").split(None, 1)
+        if len(text) < 2 or not text[1].strip():
+            bot.send_message(message.chat.id, "Usage: /discuss <message to operator channel>")
+            return
+        note = text[1].strip()
+        if _engine_manager:
+            _engine_manager.send_operator_note(note)
+        bot.send_message(message.chat.id, f"Noted for engine discuss flow ({len(note)} chars).")
+        _log(f"operator note queued via /discuss ({len(note)} chars)")
 
     @bot.message_handler(commands=["stop"])
     def handle_stop(message):
@@ -1689,7 +1748,9 @@ def run_bot():
             return
         GOAL_FILE.parent.mkdir(parents=True, exist_ok=True)
         GOAL_FILE.write_text("")
-        bot.send_message(message.chat.id, "Goal cleared. Agent loop paused.")
+        if _engine_manager:
+            _engine_manager.stop(graceful=True)
+        bot.send_message(message.chat.id, "Goal cleared. Engine loop paused.")
         _log("goal cleared via /stop command")
 
     @bot.message_handler(commands=["goal"])
@@ -1705,8 +1766,16 @@ def run_bot():
         goal_text = text[1].strip()
         GOAL_FILE.parent.mkdir(parents=True, exist_ok=True)
         GOAL_FILE.write_text(goal_text)
+
+        goals_dir = CONTEXT_DIR / "goals"
+        goals_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        (goals_dir / f"{ts}.md").write_text(goal_text)
+
+        if _engine_manager:
+            _engine_manager.start(goal_text)
         _agent_wake.set()
-        bot.send_message(message.chat.id, f"Goal set ({len(goal_text)} chars). Agent loop will pick it up.")
+        bot.send_message(message.chat.id, f"Goal set ({len(goal_text)} chars). Engine will pick it up.")
         _log(f"goal set via /goal command ({len(goal_text)} chars)")
 
     @bot.message_handler(commands=["clear"])
@@ -1969,7 +2038,9 @@ def main() -> None:
         print(f"On future starts: TAU_BOT_TOKEN='{bot_token}' python arbos.py")
         return
 
-    _log(f"arbos starting in {WORKING_DIR} (provider={PROVIDER}, model={CLAUDE_MODEL})")
+    global _engine_manager
+
+    _log(f"arbos starting in {WORKING_DIR} (provider={PROVIDER}, model={CLAUDE_MODEL}, engine={ENGINE})")
     _kill_stale_claude_procs()
     _reload_env_secrets()
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1993,21 +2064,49 @@ def main() -> None:
 
     _write_claude_settings()
 
-    _send_telegram_text("Restarted.")
+    _engine_manager = EngineManager(
+        workdir=WORKING_DIR,
+        context_dir=CONTEXT_DIR,
+        engine_name=ENGINE,
+        goal_file=GOAL_FILE,
+        inbox_file=INBOX_FILE,
+        wake_event=_agent_wake,
+        status_provider=_arbos_status_provider,
+        log_fn=_log,
+    )
 
-    threading.Thread(target=agent_loop, daemon=True).start()
+    _send_telegram_text(f"Restarted. engine={_engine_manager.engine_name}")
+
+    if _engine_manager.engine_name == "arbos":
+        threading.Thread(target=agent_loop, daemon=True).start()
+    else:
+        existing_goal = GOAL_FILE.read_text().strip() if GOAL_FILE.exists() else ""
+        if existing_goal:
+            _log("existing goal detected on startup; resuming gsd engine")
+            _engine_manager.resume()
+
     threading.Thread(target=run_bot, daemon=True).start()
 
     while not _shutdown.is_set():
         if RESTART_FLAG.exists():
             RESTART_FLAG.unlink()
-            _log("restart requested; killing children and exiting for pm2")
+            _log("restart requested; stopping engine, killing children and exiting for pm2")
+            if _engine_manager:
+                try:
+                    _engine_manager.stop(graceful=True)
+                except Exception as exc:
+                    _log(f"engine stop during restart failed: {str(exc)[:160]}")
             _kill_child_procs()
             sys.exit(0)
         _process_pending_env()
         _shutdown.wait(timeout=1)
 
-    _log("shutdown: killing children")
+    _log("shutdown: stopping engine + killing children")
+    if _engine_manager:
+        try:
+            _engine_manager.stop(graceful=True)
+        except Exception as exc:
+            _log(f"engine stop during shutdown failed: {str(exc)[:160]}")
     _kill_child_procs()
     _log("shutdown complete")
     sys.exit(0)
