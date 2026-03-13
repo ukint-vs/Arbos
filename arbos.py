@@ -1019,7 +1019,7 @@ def _claude_cmd(prompt: str, extra_flags: list[str] | None = None) -> list[str]:
 
 
 def _gsd_cmd(prompt: str) -> list[str]:
-    cmd = ["gsd", "--print"]
+    cmd = ["gsd", "--mode", "json", "--print"]
     if GSD_MODEL:
         cmd.extend(["--model", GSD_MODEL])
     cmd.append(prompt)
@@ -1092,8 +1092,16 @@ def _runner_env() -> dict[str, str]:
     return env
 
 
+def _extract_assistant_text_from_content(content: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for block in content or []:
+        if block.get("type") == "text" and block.get("text"):
+            parts.append(str(block["text"]))
+    return "\n".join(parts).strip()
+
+
 def _run_gsd_once(cmd, env, on_text=None, on_activity=None):
-    """Run gsd print-mode once, return (returncode, result_text, raw_lines, stderr)."""
+    """Run gsd JSON print-mode once, return (returncode, result_text, raw_lines, stderr)."""
     proc = subprocess.Popen(
         cmd, cwd=WORKING_DIR, env=env,
         stdin=subprocess.DEVNULL,
@@ -1104,8 +1112,9 @@ def _run_gsd_once(cmd, env, on_text=None, on_activity=None):
         _child_procs.add(proc)
 
     raw_lines: list[str] = []
-    stdout_lines: list[str] = []
     stderr_lines: list[str] = []
+    result_text = ""
+    streaming_text = ""
     timed_out = False
     last_activity = time.monotonic()
 
@@ -1130,19 +1139,86 @@ def _run_gsd_once(cmd, env, on_text=None, on_activity=None):
                 line = key.fileobj.readline()
                 if not line:
                     continue
+
                 last_activity = time.monotonic()
                 raw_lines.append(line)
 
-                text = line.rstrip()
-                if key.fileobj is proc.stdout:
-                    stdout_lines.append(line)
-                    if on_text:
-                        on_text("".join(stdout_lines)[-3000:])
-                else:
+                if key.fileobj is proc.stderr:
                     stderr_lines.append(line)
+                    continue
 
-                if on_activity and text:
-                    on_activity(text[:120])
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                try:
+                    evt = json.loads(stripped)
+                except json.JSONDecodeError:
+                    if on_activity:
+                        on_activity(stripped[:140])
+                    continue
+
+                etype = evt.get("type", "")
+
+                if etype == "tool_execution_start":
+                    tool = evt.get("toolName", "tool")
+                    args = evt.get("args", {}) or {}
+                    detail = args.get("command") or args.get("path") or args.get("query") or ""
+                    if on_activity:
+                        on_activity(f"{tool}: {str(detail)[:120]}" if detail else f"{tool} running")
+
+                elif etype == "tool_execution_update":
+                    tool = evt.get("toolName", "tool")
+                    pr = evt.get("partialResult", {}) or {}
+                    content = pr.get("content", []) if isinstance(pr, dict) else []
+                    text_frag = ""
+                    if content and isinstance(content, list):
+                        first = content[0] if isinstance(content[0], dict) else {}
+                        text_frag = str(first.get("text", "")).strip()
+                    if on_activity:
+                        on_activity(f"{tool}: {text_frag[:120]}" if text_frag else f"{tool} update")
+
+                elif etype == "message_update":
+                    ame = evt.get("assistantMessageEvent", {}) or {}
+                    mtype = ame.get("type", "")
+                    if mtype == "text_delta":
+                        delta = str(ame.get("delta", ""))
+                        if delta:
+                            streaming_text += delta
+                            if on_text:
+                                on_text(streaming_text[-3000:])
+                    elif mtype == "toolcall_end":
+                        tc = ame.get("toolCall", {}) or {}
+                        name = tc.get("name", "tool")
+                        args = tc.get("arguments", {}) or {}
+                        detail = args.get("command") or args.get("path") or args.get("query") or ""
+                        if on_activity:
+                            on_activity(f"calling {name}: {str(detail)[:120]}" if detail else f"calling {name}")
+
+                elif etype == "turn_end":
+                    msg = evt.get("message", {}) or {}
+                    text = _extract_assistant_text_from_content(msg.get("content", []) or [])
+                    if text:
+                        result_text = text
+                        if on_text:
+                            on_text(result_text[-3000:])
+
+                    usage = msg.get("usage", {}) or {}
+                    if usage:
+                        with _token_lock:
+                            _token_usage["input"] += int(usage.get("input", 0) or 0)
+                            _token_usage["output"] += int(usage.get("output", 0) or 0)
+
+                elif etype == "agent_end":
+                    msgs = evt.get("messages", []) or []
+                    for msg in reversed(msgs):
+                        if isinstance(msg, dict) and msg.get("role") == "assistant":
+                            text = _extract_assistant_text_from_content(msg.get("content", []) or [])
+                            if text:
+                                result_text = text
+                                if on_text:
+                                    on_text(result_text[-3000:])
+                                break
 
             if proc.poll() is not None:
                 break
@@ -1158,10 +1234,12 @@ def _run_gsd_once(cmd, env, on_text=None, on_activity=None):
     with _child_procs_lock:
         _child_procs.discard(proc)
 
-    result_text = "".join(stdout_lines).strip()
     stderr_output = "".join(stderr_lines).strip()
     if timed_out and not stderr_output:
         stderr_output = "(timed out)"
+
+    if not result_text.strip():
+        result_text = streaming_text.strip()
 
     return returncode, result_text, raw_lines, stderr_output
 
