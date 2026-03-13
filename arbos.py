@@ -222,6 +222,10 @@ def _redact_secrets(text: str) -> str:
 MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "4"))
 PROVIDER = os.environ.get("PROVIDER", "chutes")
 ENGINE = os.environ.get("ENGINE", "gsd").strip().lower() or "gsd"
+RUNNER = os.environ.get("RUNNER", "claude").strip().lower() or "claude"
+if RUNNER not in {"claude", "gsd"}:
+    RUNNER = "claude"
+GSD_MODEL = os.environ.get("GSD_MODEL", "").strip()
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8089"))
 PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "600"))
 CHUTES_API_KEY = os.environ.get("CHUTES_API_KEY", "")
@@ -1014,6 +1018,20 @@ def _claude_cmd(prompt: str, extra_flags: list[str] | None = None) -> list[str]:
     return cmd
 
 
+def _gsd_cmd(prompt: str) -> list[str]:
+    cmd = ["gsd", "--print"]
+    if GSD_MODEL:
+        cmd.extend(["--model", GSD_MODEL])
+    cmd.append(prompt)
+    return cmd
+
+
+def _step_cmd(prompt: str) -> list[str]:
+    if RUNNER == "gsd":
+        return _gsd_cmd(prompt)
+    return _claude_cmd(prompt)
+
+
 def _write_claude_settings():
     """Point Claude Code at the active provider (OpenRouter direct or Chutes proxy)."""
     settings_dir = WORKING_DIR / ".claude"
@@ -1064,6 +1082,88 @@ def _claude_env() -> dict[str, str]:
         env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{PROXY_PORT}"
         env["ANTHROPIC_AUTH_TOKEN"] = ""
     return env
+
+
+def _runner_env() -> dict[str, str]:
+    if RUNNER == "claude":
+        return _claude_env()
+    env = os.environ.copy()
+    env.pop("TAU_BOT_TOKEN", None)
+    return env
+
+
+def _run_gsd_once(cmd, env, on_text=None, on_activity=None):
+    """Run gsd print-mode once, return (returncode, result_text, raw_lines, stderr)."""
+    proc = subprocess.Popen(
+        cmd, cwd=WORKING_DIR, env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+    with _child_procs_lock:
+        _child_procs.add(proc)
+
+    raw_lines: list[str] = []
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    timed_out = False
+    last_activity = time.monotonic()
+
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    sel.register(proc.stderr, selectors.EVENT_READ)
+
+    try:
+        while True:
+            ready = sel.select(timeout=min(CLAUDE_TIMEOUT, 10))
+            if not ready:
+                if time.monotonic() - last_activity > CLAUDE_TIMEOUT:
+                    _log(f"gsd timeout: no output for {CLAUDE_TIMEOUT}s, killing pid={proc.pid}")
+                    proc.kill()
+                    timed_out = True
+                    break
+                if proc.poll() is not None:
+                    break
+                continue
+
+            for key, _ in ready:
+                line = key.fileobj.readline()
+                if not line:
+                    continue
+                last_activity = time.monotonic()
+                raw_lines.append(line)
+
+                text = line.rstrip()
+                if key.fileobj is proc.stdout:
+                    stdout_lines.append(line)
+                    if on_text:
+                        on_text("".join(stdout_lines)[-3000:])
+                else:
+                    stderr_lines.append(line)
+
+                if on_activity and text:
+                    on_activity(text[:120])
+
+            if proc.poll() is not None:
+                break
+    finally:
+        try:
+            sel.unregister(proc.stdout)
+            sel.unregister(proc.stderr)
+        except Exception:
+            pass
+        sel.close()
+
+    returncode = proc.wait()
+    with _child_procs_lock:
+        _child_procs.discard(proc)
+
+    result_text = "".join(stdout_lines).strip()
+    stderr_output = "".join(stderr_lines).strip()
+    if timed_out and not stderr_output:
+        stderr_output = "(timed out)"
+
+    return returncode, result_text, raw_lines, stderr_output
 
 
 def _run_claude_once(cmd, env, on_text=None, on_activity=None):
@@ -1176,18 +1276,24 @@ def run_agent(cmd: list[str], phase: str, output_file: Path,
               on_text=None, on_activity=None) -> subprocess.CompletedProcess:
     _claude_semaphore.acquire()
     try:
-        env = _claude_env()
+        env = _runner_env()
         flags = " ".join(a for a in cmd if a.startswith("-"))
+        runner = RUNNER
 
         returncode, result_text, raw_lines, stderr_output = 1, "", [], "no attempts made"
 
         for attempt in range(1, MAX_RETRIES + 1):
-            _log(f"{phase}: starting (attempt={attempt}) flags=[{flags}]")
+            _log(f"{phase}: starting (runner={runner}, attempt={attempt}) flags=[{flags}]")
             t0 = time.monotonic()
 
-            returncode, result_text, raw_lines, stderr_output = _run_claude_once(
-                cmd, env, on_text=on_text, on_activity=on_activity,
-            )
+            if runner == "gsd":
+                returncode, result_text, raw_lines, stderr_output = _run_gsd_once(
+                    cmd, env, on_text=on_text, on_activity=on_activity,
+                )
+            else:
+                returncode, result_text, raw_lines, stderr_output = _run_claude_once(
+                    cmd, env, on_text=on_text, on_activity=on_activity,
+                )
             elapsed = time.monotonic() - t0
 
             output_file.write_text("".join(raw_lines))
@@ -1293,7 +1399,7 @@ def run_step(prompt: str, step_number: int, goal_step: int = 0) -> bool:
         threading.Thread(target=_heartbeat, daemon=True).start()
 
         result = run_agent(
-            _claude_cmd(prompt),
+            _step_cmd(prompt),
             phase="step",
             output_file=run_dir / "output.txt",
             on_activity=_on_activity,
@@ -1692,6 +1798,7 @@ def run_bot():
 
         lines = [
             f"Engine: {status.get('engine')} ({status.get('mode')})",
+            f"Runner: {RUNNER}{' (' + GSD_MODEL + ')' if RUNNER == 'gsd' and GSD_MODEL else ''}",
             f"Engine running: {'yes' if status.get('running') else 'no'}",
             f"PID: {status.get('pid') or '-'}",
             f"Engine detail: {status.get('detail', '')}",
@@ -2085,7 +2192,7 @@ def main() -> None:
 
     global _engine_manager
 
-    _log(f"arbos starting in {WORKING_DIR} (provider={PROVIDER}, model={CLAUDE_MODEL}, engine={ENGINE})")
+    _log(f"arbos starting in {WORKING_DIR} (provider={PROVIDER}, model={CLAUDE_MODEL}, engine={ENGINE}, runner={RUNNER})")
     _kill_stale_claude_procs()
     _reload_env_secrets()
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
