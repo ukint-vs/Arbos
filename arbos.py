@@ -1284,6 +1284,11 @@ def run_agent(cmd: list[str], phase: str, output_file: Path,
 
         for attempt in range(1, MAX_RETRIES + 1):
             _log(f"{phase}: starting (runner={runner}, attempt={attempt}) flags=[{flags}]")
+            if on_activity:
+                if runner == "gsd":
+                    on_activity(f"runner=gsd attempt {attempt}/{MAX_RETRIES} (single-shot, waiting for output)")
+                else:
+                    on_activity(f"runner=claude attempt {attempt}/{MAX_RETRIES}")
             t0 = time.monotonic()
 
             if runner == "gsd":
@@ -1369,7 +1374,11 @@ def run_step(prompt: str, step_number: int, goal_step: int = 0) -> bool:
 
     _reset_tokens()
 
-    _last_activity = [""]
+    _last_activity = [
+        "runner=gsd is single-shot; live logs may be quiet until completion"
+        if RUNNER == "gsd"
+        else "working..."
+    ]
     _heartbeat_stop = threading.Event()
 
     def _on_activity(status: str):
