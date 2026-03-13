@@ -1962,9 +1962,10 @@ def _kill_stale_claude_procs():
 
 
 def _gsd_feedback_loop():
-    """Push compact Telegram updates when GSD state changes."""
+    """Push compact Telegram updates while GSD runs."""
     poll_s = int(os.environ.get("GSD_FEEDBACK_POLL", "8"))
     min_send_s = int(os.environ.get("GSD_FEEDBACK_MIN_SEND", "20"))
+    heartbeat_s = int(os.environ.get("GSD_FEEDBACK_HEARTBEAT", "90"))
     last_sig = ""
     last_sent = 0.0
 
@@ -1981,7 +1982,10 @@ def _gsd_feedback_loop():
             sig = f"{running}|{mode}|{detail}"
 
             now = time.time()
-            if detail and sig != last_sig and (now - last_sent) >= min_send_s:
+            changed = detail and sig != last_sig and (now - last_sent) >= min_send_s
+            heartbeat = running and detail and (now - last_sent) >= heartbeat_s
+
+            if changed or heartbeat:
                 _send_telegram_text(
                     f"GSD update\n"
                     f"• mode: {mode}\n"
